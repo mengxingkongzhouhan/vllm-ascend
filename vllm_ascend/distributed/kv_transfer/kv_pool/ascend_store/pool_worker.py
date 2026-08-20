@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import math
 import threading
+import time
 from collections.abc import Generator
 from typing import Any
 
@@ -134,6 +135,7 @@ class KVPoolWorker:
         self.use_layerwise = use_layerwise
         self.kv_role = vllm_config.kv_transfer_config.kv_role
         self.load_async = extra_config.get("load_async", False)
+        self.enable_request_timing = extra_config.get("enable_request_timing", False)
         self._invalid_block_ids: set[int] = set()
         self._invalid_block_ids_lock = threading.Lock()
         self.consumer_is_to_put = extra_config.get("consumer_is_to_put", False)
@@ -517,6 +519,7 @@ class KVPoolWorker:
                     self.tp_size,
                     self.dcp_size,
                     ready_event,
+                    enable_request_timing=self.enable_request_timing,
                 )
                 self.kv_recv_thread.start()
                 ready_event.wait()
@@ -852,6 +855,8 @@ class KVPoolWorker:
                 self.load_async,
             )
             if self.load_async:
+                if self.enable_request_timing:
+                    request.load_enqueue_time_ns = time.perf_counter_ns()
                 self.kv_recv_thread.add_request(  # type: ignore[union-attr]
                     request,
                 )
@@ -913,7 +918,20 @@ class KVPoolWorker:
                 len(key_list_c),
                 key_list_c[:3],
             )
+            read_start_ns = time.perf_counter_ns() if self.enable_request_timing else 0
             ret = self.m_store.get(key_list_c, addr_list_c, size_list_c)
+            if self.enable_request_timing:
+                read_elapsed_ms = (time.perf_counter_ns() - read_start_ns) / 1_000_000
+                total_bytes = sum(sum(sizes) for sizes in size_list_c)
+                logger.info(
+                    "KV_REQUEST_TIMING request_id=%s phase=remote_read mode=sync "
+                    "read_tokens=%d keys=%d bytes=%d elapsed_ms=%.3f",
+                    request.req_id,
+                    max(0, load_spec.kvpool_cached_tokens - load_spec.vllm_cached_tokens),
+                    len(key_list_c),
+                    total_bytes,
+                    read_elapsed_ms,
+                )
             if ret is not None and any(r != 0 for r in ret):
                 missing_block_ids = record_failed_blocks(
                     block_id_list_c,

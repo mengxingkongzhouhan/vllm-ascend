@@ -291,6 +291,35 @@ class TestKVPoolScheduler(unittest.TestCase):
         self.assertEqual(need, 48)
         self.assertTrue(is_async)
 
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.logger")
+    @patch(
+        "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.time.perf_counter_ns",
+        side_effect=[1_000_000, 3_500_000],
+    )
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
+    def test_get_num_new_matched_tokens_logs_request_timing(self, mock_client_cls, _mock_time, mock_logger):
+        config = self._make_config(extra_config={"enable_request_timing": True})
+        scheduler = KVPoolScheduler(config, use_layerwise=False)
+        mock_client_cls.return_value.lookup.return_value = 48
+
+        request = MagicMock()
+        request.prompt_token_ids = list(range(64))
+        request.num_tokens = 64
+        request.request_id = "r1"
+        request.block_hashes = [b"h"] * 4
+
+        scheduler.get_num_new_matched_tokens(request, 16)
+
+        mock_logger.info.assert_any_call(
+            "KV_REQUEST_TIMING request_id=%s phase=remote_lookup "
+            "local_hit_tokens=%d remote_hit_tokens=%d remote_new_hit_tokens=%d elapsed_ms=%.3f",
+            "r1",
+            16,
+            48,
+            32,
+            2.5,
+        )
+
 
 class TestKVPoolSchedulerBuildMeta(unittest.TestCase):
     def _make_config(self, kv_role="kv_producer", block_size=16):

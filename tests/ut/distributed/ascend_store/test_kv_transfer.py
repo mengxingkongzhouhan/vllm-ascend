@@ -17,7 +17,7 @@
 
 import threading
 import unittest
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 # isort: off
 import tests.ut.distributed.ascend_store._mock_deps  # noqa: F401, E402
@@ -432,6 +432,52 @@ class TestKVCacheStoreRecvingThread(unittest.TestCase):
         t._handle_request(req)
         keys, _, _ = store.get_calls[0]
         self.assertEqual(len(keys), 1)
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer.logger")
+    @patch(
+        "vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.kv_transfer.time.perf_counter_ns",
+        side_effect=[2_000_000, 3_000_000, 8_000_000],
+    )
+    def test_handle_request_logs_async_timing(self, _mock_time, mock_logger):
+        store = FakeStore()
+        db = FakeTokenDatabase()
+        thread = KVCacheStoreRecvingThread(
+            m_store=store,
+            token_database=db,
+            block_size=16,
+            tp_rank=0,
+            dcp_size=1,
+            ready_event=threading.Event(),
+            invalid_block_ids=set(),
+            invalid_block_ids_lock=threading.Lock(),
+            enable_request_timing=True,
+        )
+        load_spec = LoadSpec(vllm_cached_tokens=16, kvpool_cached_tokens=32, can_load=True, token_len=32)
+        request = ReqMeta(
+            req_id="r1",
+            token_len_chunk=32,
+            block_ids=[0, 1],
+            block_hashes=[b"h0", b"h1"],  # type: ignore[arg-type]
+            load_spec=load_spec,
+            load_enqueue_time_ns=1_000_000,
+        )
+
+        thread.request_queue.put(request)
+        thread._handle_request(request)
+
+        mock_logger.info.assert_called_once_with(
+            "KV_REQUEST_TIMING request_id=%s phase=remote_read mode=async "
+            "read_tokens=%d keys=%d bytes=%d queue_wait_ms=%.3f "
+            "prepare_ms=%.3f read_ms=%.3f total_ms=%.3f",
+            "r1",
+            16,
+            1,
+            16,
+            1.0,
+            1.0,
+            5.0,
+            7.0,
+        )
 
 
 @unittest.skip("LayerMultiBlockReqMeta API is deprecated, tests need update for LayerTransferTask")

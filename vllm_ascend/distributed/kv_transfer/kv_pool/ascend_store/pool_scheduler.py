@@ -1,5 +1,6 @@
 import importlib
 import math
+import time
 from typing import Any, cast
 
 import vllm.envs as envs
@@ -93,6 +94,9 @@ class KVPoolScheduler:
             "consumer_is_to_put", False
         )
         self.load_async = vllm_config.kv_transfer_config.kv_connector_extra_config.get("load_async", False)
+        self.enable_request_timing = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
+            "enable_request_timing", False
+        )
         retention_interval = getattr(envs, "VLLM_PREFIX_CACHE_RETENTION_INTERVAL", None)
         self.retention_interval = retention_interval if isinstance(retention_interval, int) else None
         self.save_decode_cache = vllm_config.kv_transfer_config.kv_connector_extra_config.get(
@@ -522,6 +526,7 @@ class KVPoolScheduler:
         ):
             return 0, False
 
+        remote_lookup_start_ns = time.perf_counter_ns() if self.enable_request_timing else 0
         if self.use_gva_layerwise:
             token_len = prompt_token_len
             num_external_hit_tokens = self._get_layerwise_gva_hit_tokens(request, token_len, num_computed_tokens)
@@ -549,6 +554,17 @@ class KVPoolScheduler:
                     self.kv_cache_group_ids,
                     hbm_hit_tokens=num_computed_tokens,
                 )
+        if self.enable_request_timing:
+            remote_lookup_elapsed_ms = (time.perf_counter_ns() - remote_lookup_start_ns) / 1_000_000
+            logger.info(
+                "KV_REQUEST_TIMING request_id=%s phase=remote_lookup "
+                "local_hit_tokens=%d remote_hit_tokens=%d remote_new_hit_tokens=%d elapsed_ms=%.3f",
+                request.request_id,
+                num_computed_tokens,
+                num_external_hit_tokens,
+                max(0, num_external_hit_tokens - num_computed_tokens),
+                remote_lookup_elapsed_ms,
+            )
 
         if num_external_hit_tokens == 0:
             return 0, False

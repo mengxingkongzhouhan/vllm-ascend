@@ -35,12 +35,36 @@ When `MultiConnector` is used, configure `kv_load_failure_policy` on the `MultiC
 | :--- | :--- |
 | `lookup_rpc_port` | Port for RPC Communication Between Pooling Scheduler Process and Worker Process: Each Instance Requires a Unique Port Configuration. |
 | `load_async` | Whether to Enable Asynchronous Loading. The default value is false. |
+| `enable_request_timing` | Whether to log per-request KV Pool lookup and load timing. The default value is false. In asynchronous mode, logs include queue wait, request preparation, backend read, and total load time. |
 | `backend` | Set the storage backend for kvpool (`mooncake`, `memcache`, `yuanrong`), with the default being `mooncake`. |
 | `consumer_is_to_put` | Whether Decode node put KV Cache into KV Pool. The default value is false. |
 | `consumer_is_to_load` | Whether Decode node load KV cache from KV Pool. The default value is false. |
 | `use_layerwise` | Enable layer-by-layer KV save/load. Only supported on the Prefill node and requires the `memcache` backend. The default value is false. |
 | `prefill_pp_size` | Prefill PP size, needs to be set when Prefill node enables PP. |
 | `prefill_pp_layer_partition` | Prefill PP layer partition, needs to be set when Prefill node enables PP. |
+
+To collect per-request timing with asynchronous loads, add both options to the
+`AscendStoreConnector` configuration:
+
+```json
+"kv_connector_extra_config": {
+    "backend": "mooncake",
+    "lookup_rpc_port": "0",
+    "load_async": true,
+    "enable_request_timing": true
+}
+```
+
+The `KV_REQUEST_TIMING` logs report the local HBM hit-token count and remote
+KV Pool query latency. Asynchronous read logs additionally report queue wait,
+request preparation, backend read, and total load latency. Model-forward logs
+report NPU execution time for every scheduler step and identify all requests
+and scheduled tokens in that batch. The time is request-exclusive only when
+`exclusive=true`; otherwise it is shared batch execution time and cannot be
+split accurately between requests. Chunked-prefill request time is the sum of
+its exclusive forward steps. Timing synchronizes each measured forward step,
+so only enable it during diagnostics. A local HBM cache hit reuses resident
+blocks and therefore has no separate read operation.
 
 ### Environment Variable Configuration
 
