@@ -43,6 +43,23 @@ When `MultiConnector` is used, configure `kv_load_failure_policy` on the `MultiC
 | `prefill_pp_size` | Prefill PP size, needs to be set when Prefill node enables PP. |
 | `prefill_pp_layer_partition` | Prefill PP layer partition, needs to be set when Prefill node enables PP. |
 
+To collect per-request timing with asynchronous loads, add both options to the
+`AscendStoreConnector` configuration:
+
+```json
+"kv_connector_extra_config": {
+    "backend": "mooncake",
+    "lookup_rpc_port": "0",
+    "load_async": true,
+    "enable_request_timing": true
+}
+```
+
+The `KV_REQUEST_TIMING` logs report the local HBM hit-token count and remote
+KV Pool query latency. Asynchronous read logs additionally report queue wait,
+request preparation, backend read, and total load latency. A local HBM cache
+hit reuses resident blocks and therefore has no separate read operation.
+
 ### Environment Variable Configuration
 
 To guarantee uniform hash generation, it is required to synchronize the PYTHONHASHSEED environment variable across all nodes upon enabling KV Pool.

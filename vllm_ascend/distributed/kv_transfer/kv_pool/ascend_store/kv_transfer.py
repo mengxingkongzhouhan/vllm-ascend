@@ -973,15 +973,15 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     block_id_list.append(block_id)
             if not key_list:
                 if self.enable_request_timing:
-                    total_elapsed_ms = (time.perf_counter_ns() - enqueue_time_ns) / 1_000_000
+                    load_end_ns = time.perf_counter_ns()
                     logger.info(
                         "KV_REQUEST_TIMING request_id=%s phase=remote_read mode=async "
                         "read_tokens=0 keys=0 bytes=0 queue_wait_ms=%.3f "
                         "prepare_ms=%.3f read_ms=0.000 total_ms=%.3f",
                         req_id,
                         queue_wait_ms,
-                        (time.perf_counter_ns() - handle_start_ns) / 1_000_000,
-                        total_elapsed_ms,
+                        (load_end_ns - handle_start_ns) / 1_000_000,
+                        (load_end_ns - enqueue_time_ns) / 1_000_000,
                     )
                 self.set_finished_request(req_id)
                 return
