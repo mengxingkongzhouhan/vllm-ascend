@@ -894,6 +894,7 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         invalid_block_ids: set[int] | None = None,
         invalid_block_ids_lock: threading.Lock | None = None,
         worker: Any = None,
+        enable_request_timing: bool = False,
     ):
         super().__init__(
             m_store,
@@ -908,8 +909,12 @@ class KVCacheStoreRecvingThread(KVTransferThread):
         self._invalid_block_ids = invalid_block_ids if invalid_block_ids is not None else set()
         self._invalid_block_ids_lock = invalid_block_ids_lock or threading.Lock()
         self.worker = worker
+        self.enable_request_timing = enable_request_timing
 
     def _handle_request(self, req_meta: ReqMeta):
+        handle_start_ns = time.perf_counter_ns() if self.enable_request_timing else 0
+        enqueue_time_ns = req_meta.load_enqueue_time_ns or handle_start_ns
+        queue_wait_ms = (handle_start_ns - enqueue_time_ns) / 1_000_000
         try:
             load_spec = req_meta.load_spec
             req_id = req_meta.req_id
@@ -967,6 +972,17 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                     size_list.append(size)
                     block_id_list.append(block_id)
             if not key_list:
+                if self.enable_request_timing:
+                    total_elapsed_ms = (time.perf_counter_ns() - enqueue_time_ns) / 1_000_000
+                    logger.info(
+                        "KV_REQUEST_TIMING request_id=%s phase=remote_read mode=async "
+                        "read_tokens=0 keys=0 bytes=0 queue_wait_ms=%.3f "
+                        "prepare_ms=%.3f read_ms=0.000 total_ms=%.3f",
+                        req_id,
+                        queue_wait_ms,
+                        (time.perf_counter_ns() - handle_start_ns) / 1_000_000,
+                        total_elapsed_ms,
+                    )
                 self.set_finished_request(req_id)
                 return
             key_list_c = key_list[self.tp_rank % len(key_list) :] + key_list[: self.tp_rank % len(key_list)]
@@ -983,7 +999,23 @@ class KVCacheStoreRecvingThread(KVTransferThread):
                 len(key_list_c),
                 key_list_c[:3],
             )
+            read_start_ns = time.perf_counter_ns() if self.enable_request_timing else 0
             ret = self.m_store.get(key_list_c, addr_list_c, size_list_c)
+            if self.enable_request_timing:
+                read_end_ns = time.perf_counter_ns()
+                logger.info(
+                    "KV_REQUEST_TIMING request_id=%s phase=remote_read mode=async "
+                    "read_tokens=%d keys=%d bytes=%d queue_wait_ms=%.3f "
+                    "prepare_ms=%.3f read_ms=%.3f total_ms=%.3f",
+                    req_id,
+                    max(0, load_spec.kvpool_cached_tokens - load_spec.vllm_cached_tokens),
+                    len(key_list_c),
+                    sum(sum(sizes) for sizes in size_list_c),
+                    queue_wait_ms,
+                    (read_start_ns - handle_start_ns) / 1_000_000,
+                    (read_end_ns - read_start_ns) / 1_000_000,
+                    (read_end_ns - enqueue_time_ns) / 1_000_000,
+                )
             if ret is not None and any(r != 0 for r in ret):
                 missing_block_ids = record_failed_blocks(
                     block_id_list_c,

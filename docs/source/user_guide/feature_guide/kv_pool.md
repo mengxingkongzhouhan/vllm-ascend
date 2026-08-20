@@ -35,6 +35,7 @@ When `MultiConnector` is used, configure `kv_load_failure_policy` on the `MultiC
 | :--- | :--- |
 | `lookup_rpc_port` | Port for RPC Communication Between Pooling Scheduler Process and Worker Process: Each Instance Requires a Unique Port Configuration. |
 | `load_async` | Whether to Enable Asynchronous Loading. The default value is false. |
+| `enable_request_timing` | Whether to log per-request KV Pool lookup and load timing. The default value is false. In asynchronous mode, logs include queue wait, request preparation, backend read, and total load time. |
 | `backend` | Set the storage backend for kvpool (`mooncake`, `memcache`, `yuanrong`), with the default being `mooncake`. |
 | `consumer_is_to_put` | Whether Decode node put KV Cache into KV Pool. The default value is false. |
 | `consumer_is_to_load` | Whether Decode node load KV cache from KV Pool. The default value is false. |
