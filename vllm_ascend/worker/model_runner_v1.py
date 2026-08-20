@@ -264,6 +264,25 @@ class ExecuteModelState(NamedTuple):
     batch_desc: BatchDescriptor
 
 
+def _is_request_timing_enabled(vllm_config: VllmConfig) -> bool:
+    kv_transfer_config = vllm_config.kv_transfer_config
+    if kv_transfer_config is None:
+        return False
+
+    extra_config = kv_transfer_config.kv_connector_extra_config or {}
+    if kv_transfer_config.kv_connector == "AscendStoreConnector":
+        return bool(extra_config.get("enable_request_timing", False))
+    if kv_transfer_config.kv_connector != "MultiConnector":
+        return False
+
+    for connector_config in extra_config.get("connectors", []):
+        if connector_config.get("kv_connector") != "AscendStoreConnector":
+            continue
+        connector_extra_config = connector_config.get("kv_connector_extra_config") or {}
+        return bool(connector_extra_config.get("enable_request_timing", False))
+    return False
+
+
 class NPUModelRunner(GPUModelRunner):
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         # Must be set before super().__init__() because parent init may call
@@ -443,6 +462,7 @@ class NPUModelRunner(GPUModelRunner):
         if vllm_config.kv_transfer_config is not None:
             self.is_kv_producer = vllm_config.kv_transfer_config.is_kv_producer
             self.is_kv_consumer = vllm_config.kv_transfer_config.is_kv_consumer
+        self.enable_request_timing = _is_request_timing_enabled(vllm_config)
 
         set_cos_and_sin(vllm_config, self.max_num_reqs, self.uniform_decode_query_len, self.dtype, self.device)
         set_mc2_tokens_capacity(vllm_config, self.max_num_reqs, self.uniform_decode_query_len)
@@ -2062,8 +2082,16 @@ class NPUModelRunner(GPUModelRunner):
         ):
             if self.cache_config.mamba_cache_mode == "align":
                 mamba_utils.do_mamba_copy_block(preprocess_bufs)
-            hidden_states = self._model_forward(
-                num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
+            hidden_states = self._model_forward_with_request_timing(
+                num_tokens_padded,
+                input_ids,
+                positions,
+                intermediate_tensors,
+                inputs_embeds,
+                request_ids=req_ids,
+                scheduled_tokens=tokens,
+                num_actual_tokens=num_tokens_unpadded,
+                **model_kwargs,
             )
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
@@ -2621,6 +2649,61 @@ class NPUModelRunner(GPUModelRunner):
 
         if forward_context.flash_comm_v1_enabled and not isinstance(hidden_states, IntermediateTensors):
             hidden_states = self._all_gather_hidden_states_and_aux(hidden_states)
+        return hidden_states
+
+    def _model_forward_with_request_timing(
+        self,
+        num_tokens_padded: int,
+        input_ids: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+        intermediate_tensors: IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        *,
+        request_ids: list[str],
+        scheduled_tokens: list[int],
+        num_actual_tokens: int,
+        **model_kwargs: dict[str, Any],
+    ):
+        if not self.enable_request_timing:
+            return self._model_forward(
+                num_tokens_padded,
+                input_ids,
+                positions,
+                intermediate_tensors,
+                inputs_embeds,
+                **model_kwargs,
+            )
+
+        start_event = torch.npu.Event(enable_timing=True)
+        end_event = torch.npu.Event(enable_timing=True)
+        start_event.record()
+        hidden_states = self._model_forward(
+            num_tokens_padded,
+            input_ids,
+            positions,
+            intermediate_tensors,
+            inputs_embeds,
+            **model_kwargs,
+        )
+        end_event.record()
+        end_event.synchronize()
+
+        active_requests = [
+            (request_id, num_tokens)
+            for request_id, num_tokens in zip(request_ids, scheduled_tokens)
+            if num_tokens > 0
+        ]
+        logger.info(
+            "KV_REQUEST_TIMING phase=model_forward request_ids=%s scheduled_tokens=%s "
+            "batch_size=%d actual_tokens=%d padded_tokens=%d elapsed_ms=%.3f exclusive=%s",
+            [request_id for request_id, _ in active_requests],
+            [num_tokens for _, num_tokens in active_requests],
+            len(active_requests),
+            num_actual_tokens,
+            num_tokens_padded,
+            start_event.elapsed_time(end_event),
+            len(active_requests) == 1,
+        )
         return hidden_states
 
     def _pad_for_sequence_parallelism(self, num_scheduled_tokens: int) -> int:

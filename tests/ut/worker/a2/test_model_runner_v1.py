@@ -16,7 +16,70 @@ from vllm.v1.kv_cache_interface import (
 
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSFAIndexerCacheSpec
 from vllm_ascend.utils import AscendDeviceType
-from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+from vllm_ascend.worker.model_runner_v1 import (
+    NPUModelRunner,
+    _is_request_timing_enabled,
+)
+
+
+class TestRequestTiming(unittest.TestCase):
+    def test_multi_connector_reads_ascend_store_timing_flag(self):
+        config = SimpleNamespace(
+            kv_transfer_config=SimpleNamespace(
+                kv_connector="MultiConnector",
+                kv_connector_extra_config={
+                    "connectors": [
+                        {
+                            "kv_connector": "MooncakeConnectorV1",
+                            "kv_connector_extra_config": {},
+                        },
+                        {
+                            "kv_connector": "AscendStoreConnector",
+                            "kv_connector_extra_config": {
+                                "enable_request_timing": True,
+                            },
+                        },
+                    ]
+                },
+            )
+        )
+
+        self.assertTrue(_is_request_timing_enabled(config))
+
+    @patch("vllm_ascend.worker.model_runner_v1.logger")
+    @patch("vllm_ascend.worker.model_runner_v1.torch.npu.Event")
+    def test_model_forward_timing_logs_npu_elapsed_time(self, mock_event_cls, mock_logger):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.enable_request_timing = True
+        runner._model_forward = MagicMock(return_value="hidden")
+        start_event = MagicMock()
+        end_event = MagicMock()
+        start_event.elapsed_time.return_value = 12.5
+        mock_event_cls.side_effect = [start_event, end_event]
+
+        result = runner._model_forward_with_request_timing(
+            128,
+            request_ids=["req0", "req1"],
+            scheduled_tokens=[96, 32],
+            num_actual_tokens=128,
+        )
+
+        self.assertEqual(result, "hidden")
+        start_event.record.assert_called_once_with()
+        end_event.record.assert_called_once_with()
+        end_event.synchronize.assert_called_once_with()
+        start_event.elapsed_time.assert_called_once_with(end_event)
+        mock_logger.info.assert_called_once_with(
+            "KV_REQUEST_TIMING phase=model_forward request_ids=%s scheduled_tokens=%s "
+            "batch_size=%d actual_tokens=%d padded_tokens=%d elapsed_ms=%.3f exclusive=%s",
+            ["req0", "req1"],
+            [96, 32],
+            2,
+            128,
+            128,
+            12.5,
+            False,
+        )
 
 
 class TestNPUModelRunnerKVCache(unittest.TestCase):

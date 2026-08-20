@@ -57,8 +57,14 @@ To collect per-request timing with asynchronous loads, add both options to the
 
 The `KV_REQUEST_TIMING` logs report the local HBM hit-token count and remote
 KV Pool query latency. Asynchronous read logs additionally report queue wait,
-request preparation, backend read, and total load latency. A local HBM cache
-hit reuses resident blocks and therefore has no separate read operation.
+request preparation, backend read, and total load latency. Model-forward logs
+report NPU execution time for every scheduler step and identify all requests
+and scheduled tokens in that batch. The time is request-exclusive only when
+`exclusive=true`; otherwise it is shared batch execution time and cannot be
+split accurately between requests. Chunked-prefill request time is the sum of
+its exclusive forward steps. Timing synchronizes each measured forward step,
+so only enable it during diagnostics. A local HBM cache hit reuses resident
+blocks and therefore has no separate read operation.
 
 ### Environment Variable Configuration
 
