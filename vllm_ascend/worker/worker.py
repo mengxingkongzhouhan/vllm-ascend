@@ -64,6 +64,12 @@ from vllm_ascend.device_allocator.sleep_mem_optimized import SleepWakeupManager
 from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.profiler.torch_npu_profiler import TorchNPUProfilerWrapper
+from vllm_ascend.startup_diagnostics import (
+    DEVICE_BIND_HINT,
+    DISTRIBUTED_INIT_HINT,
+    describe_device_start_failure,
+    track_startup_stage,
+)
 from vllm_ascend.utils import (
     AscendDeviceType,
     check_ascend_device_type,
@@ -438,7 +444,20 @@ class NPUWorker(WorkerBase):
         visible_device_index = current_platform.logical_device_id_to_visible_device_id(self.local_rank)
         device = torch.device(f"{current_platform.device_type}:{visible_device_index}")
 
-        torch.npu.set_device(device)
+        with track_startup_stage(
+            "bind_npu_device",
+            hint=DEVICE_BIND_HINT,
+            rank=self.rank,
+            local_rank=self.local_rank,
+            device=device,
+        ):
+            try:
+                torch.npu.set_device(device)
+            except RuntimeError as error:
+                explanation = describe_device_start_failure(error)
+                if explanation is None:
+                    raise
+                raise RuntimeError(f"Failed to bind {device} for rank {self.rank}. {explanation}") from error
 
         # Import _inductor for graph mode execution with triton
         # This lazy import avoids torch_npu re-initialization in patch
@@ -485,7 +504,15 @@ class NPUWorker(WorkerBase):
             )
 
         # Initialize the distributed environment.
-        self._init_worker_distributed_environment()
+        with track_startup_stage(
+            "init_distributed_environment",
+            hint=DISTRIBUTED_INIT_HINT,
+            rank=self.rank,
+            local_rank=self.local_rank,
+            world_size=self.parallel_config.world_size,
+            distributed_init_method=self.distributed_init_method,
+        ):
+            self._init_worker_distributed_environment()
         # Set random seed.
         set_random_seed(self.model_config.seed)
         # Initialize device properties used by triton kernels.
