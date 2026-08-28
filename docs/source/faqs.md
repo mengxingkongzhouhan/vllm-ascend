@@ -359,13 +359,18 @@ INFO [loggers.py] ... Prefix cache hit rate: 88.5%, External prefix cache hit ra
 
 The local prefix cache is consulted first. The KV pool is then asked only what it can add *beyond* that, and `need to load` is the difference between the two hit counts. When the local cache already covers the whole prefix, the difference is zero, the connector reports no external tokens, and the external hit rate stays at 0%. The pool lookup did hit; the hit was simply redundant, so nothing was transferred.
 
-This is the normal outcome for a benchmark with a small set of repeated prefixes, for example `vllm bench serve --dataset-name prefix_repetition --prefix-repetition-num-prefixes 10 --prefix-repetition-prefix-len 30720`. Ten prefixes are re-requested until each engine has them all resident locally, so after the warm-up every request is a local hit.
+Before changing any configuration, note that the logged rate covers one logging interval, not the whole run. Every engine keeps its own local prefix cache, so a prefix is a local miss once per engine and a local hit forever after. External hits are therefore concentrated in the warm-up, and a sample taken at steady state reads 0% even on a perfectly healthy pool. Compare the earliest intervals of the run, or the cumulative figure, before concluding the pool is not being read.
 
-To exercise the pool, make the local cache unable to answer:
+That also bounds what this benchmark can report. With `--dataset-name prefix_repetition`, `E` engines, `P` distinct prefixes and `N` prompts, only the first use of a prefix on a given engine can be an external hit, so the ceiling is roughly `E * P / N` — and all of it lands during warm-up. Ten prefixes across sixteen engines and a thousand prompts cannot exceed about 15%, and reads 0% once warm.
 
-- **Grow the prefix working set past the local KV cache.** Raise `--prefix-repetition-num-prefixes` until the distinct prefix tokens each engine sees clearly exceed its `GPU KV cache size` (printed at startup). Evicted prefixes are then served by the pool.
-- **Shrink the local cache** with a lower `--gpu-memory-utilization` or an explicit `--kv-cache-memory-bytes`, which forces the same evictions without changing the workload.
+A sustained external hit rate needs two conditions at once, so tune `P` and `N` together:
+
+- **The prefixes each engine sees must not fit in its local KV cache**, otherwise nothing is ever evicted and every reuse is a local hit. Each engine sees about `min(P, N / E)` distinct prefixes; multiply that by the prefix length and compare against the engine's `GPU KV cache size` (printed at startup). Aim for a few times larger. Lowering `--gpu-memory-utilization` or setting `--kv-cache-memory-bytes` achieves the same thing without changing the workload.
+- **Each prefix must still be reused enough to be worth caching.** Reuse per prefix is `N / P`; pushing `P` up to `N` means every prefix is requested once and there is nothing to hit at all. Keep reuse at roughly ten or more by raising `--num-prompts` alongside `--prefix-repetition-num-prefixes`.
+
+Two further options are useful for verification rather than measurement:
+
 - **Start from a cold local cache.** Run once to populate the pool, restart the instance, then replay the same dataset with the same `--seed`. The local cache is empty while the pool is warm, which is the clearest demonstration that reads come from the pool.
-- **Turn off local prefix caching** (`--no-enable-prefix-caching`) to route every lookup to the pool. Useful for verifying the pool path end to end, but not a realistic serving configuration.
+- **Turn off local prefix caching** (`--no-enable-prefix-caching`) to route every lookup to the pool. Good for proving the pool path works end to end, but not a realistic serving configuration.
 
-Also check that requests sharing a prefix are not all routed to the same engine: with sticky or prefix-aware routing the local cache absorbs everything, whereas round-robin routing spreads a prefix across engines and is exactly where a shared pool earns its place.
+If even the warm-up intervals report 0% external hits, then cross-engine sharing itself is not happening, and the workload is not the problem. Check that all engines are backed by the same store instance and namespace rather than one store each, and that block hashes are stable across processes — set `--prefix-caching-hash-algo sha256`, since the built-in hash is not guaranteed to agree between processes. Also check that requests sharing a prefix are not all routed to the same engine: with sticky or prefix-aware routing the local cache absorbs everything, whereas round-robin routing spreads a prefix across engines and is exactly where a shared pool earns its place.
