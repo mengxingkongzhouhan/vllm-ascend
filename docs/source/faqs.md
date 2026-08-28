@@ -307,3 +307,24 @@ Enable FlashComm_v1 (`VLLM_ASCEND_ENABLE_FLASHCOMM1=1`) when using Tensor Parall
 ### 26. What is the difference between FIA and PA operators for attention?
 
 FIA (Flash Attention) is the default attention operator in vLLM-Ascend. In some batch-size settings (particularly medium concurrency), FIA may exhibit suboptimal performance. The PA (Page Attention) operator can be manually enabled via `pa_shape_list` in `--additional-config`. When the runtime batch size matches a value in `pa_shape_list`, the framework switches to PA. This is a temporary tuning knob — future FIA optimizations will make this parameter obsolete.
+
+### 27. Startup hangs for minutes and then fails with "Failed to start the device" (error code 507033)
+
+Startup blocks in `torch.npu.set_device` and eventually raises something like:
+
+```text
+RuntimeError: ExchangeDevice: ... c10_npu::SetDevice(device), error code is 507033
+[Error]: Failed to start the device.
+Inner_Error_Failed_Load_Package_To_Device(E39011): Failed to load the package cann-hybm-compat.tar.gz on the device.
+TsdOpen failed. devId=2, tdt error=1.
+```
+
+Every worker fails the same way, and because the CANN runtime retries internally before giving up, the server looks frozen for several minutes first — the last thing in the log is usually the vLLM-Ascend configuration dump. vLLM-Ascend reports the stage it is waiting in (`Startup stage 'bind_npu_device' is still running after ...`) while this happens, so the log identifies where it is stuck.
+
+This is an environment-level failure; no model or vLLM option affects it. Check the following, in order:
+
+1. **Driver/firmware and CANN toolkit compatibility.** `cann-hybm-compat.tar.gz` is pushed to the device when it starts, and loading it fails when the CANN toolkit is newer than the driver it runs against. Compare `/usr/local/Ascend/driver/version.info` with `$ASCEND_HOME_PATH/*-linux/ascend_toolkit_install.info` (both values are printed in the error message) against the compatibility matrix of your CANN release, and upgrade the driver/firmware or the toolkit so that they match.
+2. **Device availability.** A card still held by a process from a previous run, or one in an unhealthy state, cannot be started again. Run `npu-smi info` to inspect it, terminate leftover processes, and reset the card with `npu-smi set -t reset -i <card_id> -c <chip_id>`.
+3. **Container setup.** The host driver directory and all `/dev/davinci*` device nodes must be mounted into the container. A partial mount lets the process start and only fails when the device is started; see [Installation](./installation.md) for the full `docker run` device list.
+
+Host logs under `~/ascend/log` and device logs under `/var/log/npu` carry the underlying driver error.
