@@ -69,6 +69,7 @@ from vllm_ascend.startup_diagnostics import (
     DISTRIBUTED_INIT_HINT,
     describe_device_start_failure,
     track_startup_stage,
+    visible_device_inventory,
 )
 from vllm_ascend.utils import (
     AscendDeviceType,
@@ -450,6 +451,7 @@ class NPUWorker(WorkerBase):
             rank=self.rank,
             local_rank=self.local_rank,
             device=device,
+            visible_devices=visible_device_inventory(),
         ):
             try:
                 torch.npu.set_device(device)

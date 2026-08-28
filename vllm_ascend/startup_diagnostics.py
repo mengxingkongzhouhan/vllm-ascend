@@ -42,6 +42,12 @@ STARTUP_STAGE_REPORT_INTERVAL_SECONDS = 60.0
 DEFAULT_ASCEND_HOME_PATH = "/usr/local/Ascend/ascend-toolkit/latest"
 ASCEND_DRIVER_VERSION_FILE = "/usr/local/Ascend/driver/version.info"
 ASCEND_TOOLKIT_INSTALL_INFO_GLOB = "*-linux/ascend_toolkit_install.info"
+ASCEND_DEVICE_NODE_GLOB = "/dev/davinci[0-9]*"
+
+# Set by the Ascend container runtime to the devices granted to a container.
+# Only the granted devices can be started, no matter how many device nodes the
+# container can see.
+ASCEND_VISIBLE_DEVICES_ENV = "ASCEND_VISIBLE_DEVICES"
 
 DEVICE_BIND_HINT = (
     "A device bind that never returns usually means the NPU is still held by a "
@@ -188,6 +194,22 @@ def ascend_version_summary() -> str:
     return ", ".join(parts)
 
 
+def visible_device_inventory() -> str:
+    """Summarise which NPUs this process is allowed to start.
+
+    In a container these two answers can disagree: the device nodes are what the
+    process can open, while ``ASCEND_VISIBLE_DEVICES`` is what the container
+    runtime actually granted. Starting a device outside the granted set fails,
+    so report both.
+    """
+    visible_devices = os.environ.get(ASCEND_VISIBLE_DEVICES_ENV)
+    device_nodes = sorted(os.path.basename(node) for node in glob.glob(ASCEND_DEVICE_NODE_GLOB))
+    return (
+        f"{ASCEND_VISIBLE_DEVICES_ENV}={visible_devices if visible_devices else 'unset'}, "
+        f"device nodes={device_nodes if device_nodes else 'none'}"
+    )
+
+
 def describe_device_start_failure(error: BaseException) -> str | None:
     """Explain a CANN device-start failure, or return ``None`` if unrecognised.
 
@@ -204,18 +226,20 @@ def describe_device_start_failure(error: BaseException) -> str | None:
         "The CANN runtime failed to start the NPU. This is an environment-level "
         "failure: the model, vLLM and vllm-ascend configuration are not "
         "involved. Check, in this order:\n"
-        "1. Driver/firmware and CANN toolkit compatibility. A device-side "
+        "1. Device allocation. A device that the container runtime did not grant "
+        "cannot be started even when its device node is visible, which is the "
+        f"usual cause in Kubernetes. Detected {visible_device_inventory()}; make "
+        "sure the device this rank binds is in the granted set, and that the "
+        "requested device count matches the tensor/data parallel size.\n"
+        "2. Driver/firmware and CANN toolkit compatibility. A device-side "
         "package such as cann-hybm-compat.tar.gz fails to load when the "
         f"toolkit is newer than the driver it runs against. Detected {ascend_version_summary()}; "
         "compare them against the compatibility matrix of your CANN release and "
         "upgrade the driver/firmware or the toolkit so they match.\n"
-        "2. Device availability. A card still held by a process from a previous "
+        "3. Device availability. A card still held by a process from a previous "
         "run, or one in an unhealthy state, cannot be started again. Run "
         "`npu-smi info` to inspect it, terminate leftover processes, and reset "
         "the card with `npu-smi set -t reset -i <card_id> -c <chip_id>`.\n"
-        "3. Container setup. The host driver directory and the /dev/davinci* "
-        "device nodes must all be mounted into the container; a partial mount "
-        "lets the process start but makes device start fail.\n"
         "Host logs under ~/ascend/log and device logs under /var/log/npu carry "
         "the underlying driver error."
     )

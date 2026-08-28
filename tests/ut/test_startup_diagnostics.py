@@ -19,9 +19,11 @@ from unittest.mock import patch
 
 from tests.ut.base import TestBase
 from vllm_ascend.startup_diagnostics import (
+    ASCEND_VISIBLE_DEVICES_ENV,
     ascend_version_summary,
     describe_device_start_failure,
     track_startup_stage,
+    visible_device_inventory,
 )
 
 # Abridged form of the failure reported by torch_npu when the CANN runtime
@@ -106,6 +108,7 @@ class TestDescribeDeviceStartFailure(TestBase):
         self.assertIn("failed to start the NPU", explanation)
         self.assertIn("npu-smi info", explanation)
         self.assertIn("driver=", explanation)
+        self.assertIn(ASCEND_VISIBLE_DEVICES_ENV, explanation)
 
     def test_each_marker_is_recognised_on_its_own(self):
         for marker in ("507033", "E39011", "Failed to start the device", "TsdOpen failed"):
@@ -139,6 +142,32 @@ class TestAscendVersionSummary(TestBase):
 
         self.assertIn("driver=unknown", summary)
         self.assertIn("toolkit=unknown", summary)
+
+
+class TestVisibleDeviceInventory(TestBase):
+    def test_granted_devices_and_nodes_are_both_reported(self):
+        with (
+            patch.dict(os.environ, {ASCEND_VISIBLE_DEVICES_ENV: "2"}),
+            patch(
+                "vllm_ascend.startup_diagnostics.glob.glob",
+                return_value=["/dev/davinci7", "/dev/davinci2"],
+            ),
+        ):
+            inventory = visible_device_inventory()
+
+        self.assertIn(f"{ASCEND_VISIBLE_DEVICES_ENV}=2", inventory)
+        # Sorted so a mismatch between granted and visible devices is obvious.
+        self.assertIn("device nodes=['davinci2', 'davinci7']", inventory)
+
+    def test_absent_allocation_and_nodes_are_reported(self):
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch("vllm_ascend.startup_diagnostics.glob.glob", return_value=[]),
+        ):
+            inventory = visible_device_inventory()
+
+        self.assertIn(f"{ASCEND_VISIBLE_DEVICES_ENV}=unset", inventory)
+        self.assertIn("device nodes=none", inventory)
 
 
 class TestReadVersion(TestBase):
