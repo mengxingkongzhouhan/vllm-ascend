@@ -347,3 +347,25 @@ Read the numbers in the message before changing anything:
 - **It coincides with client-side timeouts or aborts**: a client that gives up after prefill leaves nothing to pull. Align the client timeout with `VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT`.
 
 If pulls are failing rather than arriving late, check the transfer network between the instances: `NETWORK_CARD_NAME`/`IP_ADDRESS` in the launch scripts, `/etc/hccn.conf`, and reachability of the side-channel port. Raising `VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT` only delays the cleanup; it does not make the pull happen.
+
+### 29. "External prefix cache hit rate" stays at 0% even though the KV pool reports hits
+
+The two numbers measure different things, and a large pool hit next to a 0% external hit rate is consistent rather than contradictory:
+
+```text
+INFO [pool_scheduler.py] Reqid: ..., Total tokens 30856, kvpool hit tokens: 30720, local prefix cache hit tokens: 30720, need to load: 0
+INFO [loggers.py] ... Prefix cache hit rate: 88.5%, External prefix cache hit rate: 0.0%
+```
+
+The local prefix cache is consulted first. The KV pool is then asked only what it can add *beyond* that, and `need to load` is the difference between the two hit counts. When the local cache already covers the whole prefix, the difference is zero, the connector reports no external tokens, and the external hit rate stays at 0%. The pool lookup did hit; the hit was simply redundant, so nothing was transferred.
+
+This is the normal outcome for a benchmark with a small set of repeated prefixes, for example `vllm bench serve --dataset-name prefix_repetition --prefix-repetition-num-prefixes 10 --prefix-repetition-prefix-len 30720`. Ten prefixes are re-requested until each engine has them all resident locally, so after the warm-up every request is a local hit.
+
+To exercise the pool, make the local cache unable to answer:
+
+- **Grow the prefix working set past the local KV cache.** Raise `--prefix-repetition-num-prefixes` until the distinct prefix tokens each engine sees clearly exceed its `GPU KV cache size` (printed at startup). Evicted prefixes are then served by the pool.
+- **Shrink the local cache** with a lower `--gpu-memory-utilization` or an explicit `--kv-cache-memory-bytes`, which forces the same evictions without changing the workload.
+- **Start from a cold local cache.** Run once to populate the pool, restart the instance, then replay the same dataset with the same `--seed`. The local cache is empty while the pool is warm, which is the clearest demonstration that reads come from the pool.
+- **Turn off local prefix caching** (`--no-enable-prefix-caching`) to route every lookup to the pool. Useful for verifying the pool path end to end, but not a realistic serving configuration.
+
+Also check that requests sharing a prefix are not all routed to the same engine: with sticky or prefix-aware routing the local cache absorbs everything, whereas round-robin routing spreads a prefix across engines and is exactly where a shared pool earns its place.
