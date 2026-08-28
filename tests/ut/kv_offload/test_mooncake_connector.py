@@ -59,6 +59,7 @@ patch("vllm.distributed.parallel_state._DCP", _mock_dcp_group).start()
 patch("torch.npu.set_device").start()
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import (  # noqa: E402
+    MAX_LOGGED_EXPIRED_REQUEST_IDS,
     MAX_REQUESTS_PER_PEER_HANDLER,
     GroupPull,
     KVCacheRecvingThread,
@@ -1302,6 +1303,38 @@ class TestKVCacheTaskTracker(unittest.TestCase):
         result_delay = self.tracker.delayed_free_requests
         self.assertEqual(len(result_delay), 1)
         self.assertIn("req_2", result_delay)
+
+    def test_expired_requests_are_reported_as_one_batch(self):
+        current_time = time.time()
+        expired_ids = [f"req_{index}" for index in range(MAX_LOGGED_EXPIRED_REQUEST_IDS + 2)]
+        for request_id in expired_ids:
+            self.tracker.add_req_to_process(request_id)
+            self.tracker.add_delayed_request(request_id, current_time - 100000)
+        self.tracker.add_req_to_process("req_pending")
+        self.tracker.add_delayed_request("req_pending", current_time)
+
+        with patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.logger") as mock_logger:
+            result = self.tracker._retrieve_expired_requests()
+
+        self.assertEqual(result, set(expired_ids))
+        # One line for the whole sweep, not one per expired request.
+        self.assertEqual(mock_logger.error.call_count, 1)
+        error_args = mock_logger.error.call_args[0]
+        self.assertEqual(error_args[1], len(expired_ids))
+        # The longest wait is reported, and the still-pending request is counted
+        # as remaining backlog rather than force freed.
+        self.assertGreater(error_args[2], 100000 - 1)
+        self.assertEqual(error_args[4], 1)
+        self.assertEqual(len(error_args[6]), MAX_LOGGED_EXPIRED_REQUEST_IDS)
+
+    def test_nothing_is_reported_when_no_request_expired(self):
+        self.tracker.add_req_to_process("req_1")
+        self.tracker.add_delayed_request("req_1", time.time())
+
+        with patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector.logger") as mock_logger:
+            self.assertEqual(self.tracker._retrieve_expired_requests(), set())
+
+        mock_logger.error.assert_not_called()
 
     def test_duplicate_task_update(self):
         self.tracker.add_req_to_process("req1")

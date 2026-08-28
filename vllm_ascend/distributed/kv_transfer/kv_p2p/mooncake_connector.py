@@ -88,6 +88,10 @@ DONE_RECVING_MSG = b"done_recving_msg"
 # other peers already waiting in the global executor queue can make progress.
 MAX_REQUESTS_PER_PEER_HANDLER = 5
 
+# Enough ids to correlate a force-free sweep with the requests a client saw fail,
+# without turning one log line into a dump of a whole benchmark run.
+MAX_LOGGED_EXPIRED_REQUEST_IDS = 5
+
 
 class RemotePortInfo(TypedDict):
     num: int
@@ -222,24 +226,38 @@ class KVCacheTaskTracker:
     def _retrieve_expired_requests(self):
         """Retrieve all expired delayed requests."""
         expired_requests: set[str] = set()
+        longest_wait = 0.0
         # Free delayed requests if they exceed the timeout
         current_time = time.time()
         while self.delayed_free_requests:
             request_id = next(iter(self.delayed_free_requests))
             delay_start_time = self.delayed_free_requests[request_id]
-            if current_time - delay_start_time > envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT:
+            waited = current_time - delay_start_time
+            if waited > envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT:
                 self.delayed_free_requests.popitem(last=False)
                 self.reqs_to_process.discard(request_id)
                 expired_requests.add(request_id)
-                logger.error(
-                    "Force freed expired request: %s. "
-                    "Reason: Request exceeded timeout threshold (%s seconds). "
-                    "Action: Resources have been forcibly released to prevent memory leak.",
-                    request_id,
-                    envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT,
-                )
+                longest_wait = max(longest_wait, waited)
             else:
                 break
+        if expired_requests:
+            # A whole batch can expire in one sweep, so report the batch instead
+            # of one line per request: the counts are what distinguish a
+            # saturated decode instance from a handful of aborted requests.
+            logger.error(
+                "Force freed %d expired requests: the decode side never pulled their kv cache. "
+                "The longest waited %.0f s against the %s s VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT "
+                "threshold, and the delayed queue depth is now %d. Their blocks are released to prevent "
+                "a memory leak, so a pull arriving later cannot be served. Usual causes: the "
+                "decode instance is saturated or was restarted, or it cannot reach this instance "
+                "over the transfer network. Request ids (up to %d): %s",
+                len(expired_requests),
+                longest_wait,
+                envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT,
+                len(self.delayed_free_requests),
+                MAX_LOGGED_EXPIRED_REQUEST_IDS,
+                sorted(expired_requests)[:MAX_LOGGED_EXPIRED_REQUEST_IDS],
+            )
         return expired_requests
 
 
