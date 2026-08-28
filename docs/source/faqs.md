@@ -363,10 +363,13 @@ Before changing any configuration, note that the logged rate covers one logging 
 
 That also bounds what this benchmark can report. With `--dataset-name prefix_repetition`, `E` engines, `P` distinct prefixes and `N` prompts, only the first use of a prefix on a given engine can be an external hit, so the ceiling is roughly `E * P / N` — and all of it lands during warm-up. Ten prefixes across sixteen engines and a thousand prompts cannot exceed about 15%, and reads 0% once warm.
 
-A sustained external hit rate needs two conditions at once, so tune `P` and `N` together:
+A sustained external hit rate needs three conditions at once, so tune `P` and `N` together and check the request order:
 
-- **The prefixes each engine sees must not fit in its local KV cache**, otherwise nothing is ever evicted and every reuse is a local hit. Each engine sees about `min(P, N / E)` distinct prefixes; multiply that by the prefix length and compare against the engine's `GPU KV cache size` (printed at startup). Aim for a few times larger. Lowering `--gpu-memory-utilization` or setting `--kv-cache-memory-bytes` achieves the same thing without changing the workload.
+- **The prefixes each engine sees must not fit in its local KV cache**, otherwise nothing is ever evicted and every reuse is a local hit. Each engine sees about `min(P, N / E)` distinct prefixes; multiply that by the prefix length and compare against the engine's `GPU KV cache size` (printed at startup). Aim for a few times larger. Lowering `--gpu-memory-utilization` or setting `--kv-cache-memory-bytes` achieves the same thing without changing the workload — at the cost of throughput, so this trades production capacity for a more pool-heavy measurement.
 - **Each prefix must still be reused enough to be worth caching.** Reuse per prefix is `N / P`; pushing `P` up to `N` means every prefix is requested once and there is nothing to hit at all. Keep reuse at roughly ten or more by raising `--num-prompts` alongside `--prefix-repetition-num-prefixes`.
+- **Reuses must be far enough apart to be evicted in between.** Overflowing the cache is not enough on its own: if the workload sends all requests for one prefix back to back, or the router pins a prefix to one engine, that engine answers every reuse from its local cache no matter how small the cache is. A local hit rate far above the fraction of prefixes that fit in the cache is the signature of this, and it means the ordering or the routing is what to change, not the cache size.
+
+A quick way to measure the capacity in prefixes: when a log line reports `Running: 0 reqs`, the reported `GPU KV cache usage` is entirely cached blocks, so the percentage that one prefix occupies gives the capacity directly. A 30720-token prefix sitting at 47.3% means roughly 65000 tokens of KV cache, or about two such prefixes per engine.
 
 Two further options are useful for verification rather than measurement:
 
