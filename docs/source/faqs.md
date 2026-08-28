@@ -367,9 +367,18 @@ A sustained external hit rate needs three conditions at once, so tune `P` and `N
 
 - **The prefixes each engine sees must not fit in its local KV cache**, otherwise nothing is ever evicted and every reuse is a local hit. Each engine sees about `min(P, N / E)` distinct prefixes; multiply that by the prefix length and compare against the engine's `GPU KV cache size` (printed at startup). Aim for a few times larger. Lowering `--gpu-memory-utilization` or setting `--kv-cache-memory-bytes` achieves the same thing without changing the workload — at the cost of throughput, so this trades production capacity for a more pool-heavy measurement.
 - **Each prefix must still be reused enough to be worth caching.** Reuse per prefix is `N / P`; pushing `P` up to `N` means every prefix is requested once and there is nothing to hit at all. Keep reuse at roughly ten or more by raising `--num-prompts` alongside `--prefix-repetition-num-prefixes`.
-- **Reuses must be far enough apart to be evicted in between.** Overflowing the cache is not enough on its own: if the workload sends all requests for one prefix back to back, or the router pins a prefix to one engine, that engine answers every reuse from its local cache no matter how small the cache is. A local hit rate far above the fraction of prefixes that fit in the cache is the signature of this, and it means the ordering or the routing is what to change, not the cache size.
+- **Reuses must be far enough apart to be evicted in between.** Overflowing the aggregate working set is not enough on its own: if the workload sends all requests for one prefix back to back, or the router pins a prefix to one engine, that engine answers every reuse from its local cache no matter how small the cache is. A local hit rate far above the fraction of prefixes that fit in one engine's cache is the signature of this.
 
 A quick way to measure the capacity in prefixes: when a log line reports `Running: 0 reqs`, the reported `GPU KV cache usage` is entirely cached blocks, so the percentage that one prefix occupies gives the capacity directly. A 30720-token prefix sitting at 47.3% means roughly 65000 tokens of KV cache, or about two such prefixes per engine.
+
+With prefix-aware or sticky routing the third condition still holds, but the quantity to compare against the cache is the prefixes *per engine* rather than the total. A prefix always returns to the same engine, so that engine must be unable to keep its own assigned set resident: `P / E` prefixes have to overflow one engine's KV cache. Ten prefixes over sixteen engines is under one prefix each and will never evict, however many engines there are. Sticky routing does not have to be turned off to see external hits; `P` has to be raised past `E` times the per-engine capacity in prefixes, with `N` raised alongside it to keep reuse up.
+
+Two further sources of external hits exist under sticky routing and need no workload change at all:
+
+- **KV pressure from concurrent requests.** Running requests allocate blocks from the same cache and evict the cached prefixes. When the prompt is a large fraction of the cache, a handful of concurrent requests is enough. A benchmark sample that shows `Running: 0 reqs` has no such pressure, which is a common reason a measurement reports nothing while production would not.
+- **Topology changes.** An engine restart, or a router remap after scaling, moves a prefix to an engine that has never seen it, which then loads from the pool. This is much of the value of a shared pool under sticky routing, and the cold-start replay above is the way to measure it.
+
+Note that layerwise mode loads from the pool even when the local cache already holds the tokens, but the connector still reports the local-vs-pool difference, so the external hit rate stays at 0% regardless. Do not enable it expecting this metric to move.
 
 Two further options are useful for verification rather than measurement:
 
