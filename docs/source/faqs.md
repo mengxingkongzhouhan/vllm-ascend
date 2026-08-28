@@ -328,3 +328,22 @@ This is an environment-level failure; no model or vLLM option affects it. Check 
 3. **Device availability.** A card still held by a process from a previous run, or one in an unhealthy state, cannot be started again. Run `npu-smi info` to inspect it, terminate leftover processes, and reset the card with `npu-smi set -t reset -i <card_id> -c <chip_id>`.
 
 Host logs under `~/ascend/log` and device logs under `/var/log/npu` carry the underlying driver error, so mount `/var/log/npu` into the container if it is not already available there.
+
+### 28. The prefill instance logs "Force freed ... expired requests" during P/D disaggregation
+
+```text
+ERROR [mooncake_connector.py] Force freed 12 expired requests: the decode side never pulled their kv cache. ...
+```
+
+After prefill finishes a request, the prefill instance deliberately keeps its KV blocks allocated and waits for the decode instance to pull them. The blocks are only released once the decode side reports the pull as complete. If no such report arrives within `VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT` seconds, the prefill instance force-frees the blocks and logs this message.
+
+So the message is a symptom on the prefill side of the decode side not consuming, not a fault of the prefill instance. Until the timeout fires, every affected request pins its blocks, so a steady stream of these lines also means the prefill KV cache is being consumed by requests that will never be served — expect queueing and falling throughput alongside them.
+
+Read the numbers in the message before changing anything:
+
+- **The delayed queue depth keeps growing** and the longest wait sits close to the threshold: the decode instance cannot keep up with what the proxy dispatches to it, or is stalled. Check the decode instance's queue and KV cache usage, and lower the request rate or add decode capacity.
+- **Only some prefill ranks report it**, consistently the same ones: suspect a P/D topology mismatch (TP/DP/EP sizes, or the `remote_*` parameters the proxy passes), which leaves some ranks never notified.
+- **It starts after a decode instance restart**: requests in flight at the time can never be pulled, and these lines are the expected cleanup. They should stop once the backlog drains.
+- **It coincides with client-side timeouts or aborts**: a client that gives up after prefill leaves nothing to pull. Align the client timeout with `VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT`.
+
+If pulls are failing rather than arriving late, check the transfer network between the instances: `NETWORK_CARD_NAME`/`IP_ADDRESS` in the launch scripts, `/etc/hccn.conf`, and reachability of the side-channel port. Raising `VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT` only delays the cleanup; it does not make the pull happen.
