@@ -183,3 +183,34 @@ Similarly, let's take `Qwen2.5-VL-7B-Instruct` benchmark as an example:
   --model Qwen/Qwen2.5-7B-Instruct --tensor-parallel-size 1 \
   --load-format dummy --num-iters-warmup 5 --num-iters 15
   ```
+
+### Exercising the local prefix cache and the KV pool together
+
+The local prefix cache is consulted before the KV pool, and the pool is only credited with the tokens it adds on top. A workload built from one set of repeated prefixes therefore drives one hit rate or the other but not both: whatever the local cache holds, the pool contributes nothing for. `vllm bench serve --dataset-name prefix_repetition` offers exactly one such set, which is why it commonly reports a high `Prefix cache hit rate` next to `External prefix cache hit rate: 0.0%`.
+
+`benchmarks/scripts/two_tier_prefix_bench.py` drives a two-tier workload instead. A small **hot** set of prefixes is re-requested often enough to stay resident locally and produces the local hit rate, while a much larger **warm** set is cycled round-robin so each prefix is evicted before its next use and has to be re-read from the pool. It also seeds the pool before measuring, because a pool starts empty and the first use of a prefix can only be a miss — the usual reason a first run shows no external hits while a second run does.
+
+Before sending anything, the script checks the plan against the KV cache budget and refuses combinations that cannot work, since a long prefix often leaves room for only one or two of them and no request ordering can fix that. Pass the per-engine `GPU KV cache size` printed at startup, the number of prefill engines, and whether the router pins a prefix to one engine:
+
+```shell
+python benchmarks/scripts/two_tier_prefix_bench.py \
+  --host $BENCH_HOST --port $BENCH_PORT \
+  --model qwen3 --tokenizer $TOKENIZER_PATH \
+  --kv-cache-tokens 64947 --engines 16 --sticky-routing \
+  --prefix-len 8192 --suffix-len 128 --output-len 128 \
+  --hot-prefixes 16 --warm-prefixes 384 --hot-fraction 0.5 \
+  --num-prompts 8000 --concurrency 16
+```
+
+The capacity plan it prints first shows how the budget is spent, and each rejection names the argument to change:
+
+```text
+Capacity plan (per engine)
+  prompt                : 8,320 tokens (65 blocks)
+  KV cache              : 64,947 tokens
+  free for prefixes     : 56,627 tokens = 6.91 prefixes
+  hot prefixes / engine : 1.00 (expected to stay resident)
+  warm prefixes / engine: 24.00 for 5.91 free slots
+```
+
+Read both rates from the server log over the measured phase only. `Prefix cache hit rate` is driven by the hot tier and `External prefix cache hit rate` by the warm tier; warm requests should show a non-zero `need to load` in the `kvpool hit tokens ... local prefix cache hit tokens ... need to load` lines. See [FAQ 29](../docs/source/faqs.md) for how to interpret a rate that stays at zero.
