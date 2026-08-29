@@ -15,31 +15,12 @@
 from __future__ import annotations
 
 import argparse
-import importlib.util
-import sys
-from pathlib import Path
-from types import ModuleType
-from unittest.mock import MagicMock
 
 import pytest
 
-SCRIPT_PATH = Path(__file__).resolve().parents[3] / "benchmarks" / "scripts" / "two_tier_prefix_bench.py"
+from tests.ut.benchmarks.loader import CollapsingTokenizer, FakeTokenizer, load_bench_script
 
-
-def _load_script() -> ModuleType:
-    """Import the benchmark script by path; it is a CLI, not an installed package."""
-    sys.modules.setdefault("aiohttp", MagicMock())
-    spec = importlib.util.spec_from_file_location("two_tier_prefix_bench", SCRIPT_PATH)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    # @dataclass resolves annotations through sys.modules, so register the
-    # module before executing it.
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-bench = _load_script()
+bench = load_bench_script("two_tier_prefix_bench")
 
 
 def make_args(**overrides) -> argparse.Namespace:
@@ -63,27 +44,6 @@ def make_args(**overrides) -> argparse.Namespace:
     for key, value in overrides.items():
         setattr(args, key, value)
     return args
-
-
-class FakeTokenizer:
-    """One token per whitespace word, round-tripping content like a real one."""
-
-    def encode(self, text, add_special_tokens=False):
-        self._words = text.split()
-        return list(range(len(self._words)))
-
-    def decode(self, ids):
-        return " ".join(self._words[index] for index in ids)
-
-
-class CollapsingTokenizer:
-    """Pathological tokenizer whose decode discards the input content."""
-
-    def encode(self, text, add_special_tokens=False):
-        return list(range(len(text.split())))
-
-    def decode(self, ids):
-        return " ".join(f"t{index}" for index in ids)
 
 
 @pytest.mark.parametrize(
@@ -181,15 +141,15 @@ def test_sequence_is_reproducible_for_a_fixed_seed():
 
 
 def test_prefixes_are_distinct_and_reproducible():
-    texts = bench.build_prefix_texts(FakeTokenizer(), 5, 32, seed=7)
+    texts = bench.build_distinct_texts(FakeTokenizer(), 5, 32, seed=7, label="hot")
 
     assert len(set(texts)) == 5
     assert all(len(text.split()) == 32 for text in texts)
-    assert texts == bench.build_prefix_texts(FakeTokenizer(), 5, 32, seed=7)
+    assert texts == bench.build_distinct_texts(FakeTokenizer(), 5, 32, seed=7, label="hot")
 
 
 def test_indistinct_prefixes_fail_loudly():
     # Prefixes that collapse into one would silently turn the whole workload
     # into a single-prefix run, so this must not pass quietly.
-    with pytest.raises(RuntimeError, match="distinct prefixes"):
-        bench.build_prefix_texts(CollapsingTokenizer(), 5, 32, seed=7)
+    with pytest.raises(RuntimeError, match="distinct hots"):
+        bench.build_distinct_texts(CollapsingTokenizer(), 5, 32, seed=7, label="hot")

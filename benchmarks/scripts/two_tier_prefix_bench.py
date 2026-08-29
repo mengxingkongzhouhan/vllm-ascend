@@ -48,12 +48,22 @@ import argparse
 import asyncio
 import json
 import random
-import statistics
 import sys
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import aiohttp
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from prefix_cache_bench_common import (
+    LatencyStats,  # noqa: E402
+    align_up,  # noqa: E402
+    build_distinct_texts,  # noqa: E402
+    report_group,  # noqa: E402
+    send_chat,  # noqa: E402
+)
 
 # Requests whose prompt is a large fraction of the cache leave little room for
 # cached prefixes, so the planner insists on at least this many free prefix
@@ -63,9 +73,6 @@ MIN_WARM_SLOTS = 1
 # How many times larger the per-engine warm set must be than the slots it can
 # occupy, so that a warm prefix is reliably evicted before its next use.
 WARM_OVERFLOW_FACTOR = 3
-
-# Percentiles reported for latency metrics.
-REPORTED_PERCENTILES = (50, 99)
 
 
 @dataclass
@@ -80,10 +87,6 @@ class Plan:
     warm_per_engine: float
     warm_slots: float
     problems: list[str] = field(default_factory=list)
-
-
-def align_up(value: int, multiple: int) -> int:
-    return -(-value // multiple) * multiple
 
 
 def plan_capacity(args: argparse.Namespace) -> Plan:
@@ -160,30 +163,6 @@ def report_plan(plan: Plan, args: argparse.Namespace) -> None:
         print(f"  PROBLEM: {problem}")
 
 
-def build_prefix_texts(tokenizer, count: int, num_tokens: int, seed: int) -> list[str]:
-    """Build `count` distinct texts, each close to `num_tokens` tokens long.
-
-    Exactness is best effort: what matters for cache hits is that every request
-    reusing a prefix sends a byte-identical string, which it does because each
-    prefix is built once here and reused verbatim.
-    """
-    rng = random.Random(seed)
-    texts = []
-    for index in range(count):
-        words = [f"{index:06d}"] + [str(rng.randint(100000, 999999)) for _ in range(num_tokens)]
-        token_ids = tokenizer.encode(" ".join(words), add_special_tokens=False)
-        while len(token_ids) < num_tokens:
-            words.append(str(rng.randint(100000, 999999)))
-            token_ids = tokenizer.encode(" ".join(words), add_special_tokens=False)
-        texts.append(tokenizer.decode(token_ids[:num_tokens]))
-    if len(set(texts)) != count:
-        raise RuntimeError(
-            f"built {len(set(texts))} distinct prefixes out of {count} requested. Prefixes must all differ, "
-            "otherwise requests share a prefix and the tiers collapse into one."
-        )
-    return texts
-
-
 @dataclass
 class Request:
     tier: str
@@ -211,36 +190,14 @@ def build_sequence(hot: list[str], warm: list[str], suffixes: list[str], args: a
     return sequence
 
 
-@dataclass
-class Result:
-    ok: bool
-    ttft: float = 0.0
-    latency: float = 0.0
-
-
-async def send_one(session: aiohttp.ClientSession, url: str, payload: dict, timeout: float) -> Result:
-    started = time.perf_counter()
-    ttft = 0.0
-    try:
-        async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=timeout)) as response:
-            if response.status != 200:
-                await response.read()
-                return Result(ok=False)
-            async for chunk in response.content:
-                if not ttft and chunk.strip() and chunk.startswith(b"data:"):
-                    ttft = time.perf_counter() - started
-    except (aiohttp.ClientError, TimeoutError, asyncio.TimeoutError):
-        return Result(ok=False)
-    return Result(ok=True, ttft=ttft, latency=time.perf_counter() - started)
-
-
-async def run_phase(name: str, requests: list[Request], args: argparse.Namespace) -> list[Result]:
+async def run_phase(name: str, requests: list[Request], args: argparse.Namespace) -> None:
     """Send one phase of the workload under a fixed in-flight limit."""
     url = f"http://{args.host}:{args.port}{args.endpoint}"
     semaphore = asyncio.Semaphore(args.concurrency)
     print(f"\nPhase '{name}': {len(requests)} requests at concurrency {args.concurrency}")
+    stats = {tier: LatencyStats(f"{tier} requests") for tier in ("hot", "warm")}
 
-    async def worker(request: Request) -> Result:
+    async def worker(request: Request) -> None:
         payload = {
             "model": args.model,
             "messages": [{"role": "user", "content": f"{request.prefix} {request.suffix}"}],
@@ -250,37 +207,19 @@ async def run_phase(name: str, requests: list[Request], args: argparse.Namespace
             "temperature": 0.0,
         }
         async with semaphore:
-            return await send_one(session, url, payload, args.request_timeout)
+            stats[request.tier].add(await send_chat(session, url, payload, args.request_timeout))
 
     started = time.perf_counter()
     connector = aiohttp.TCPConnector(limit=0)
     async with aiohttp.ClientSession(connector=connector) as session:
-        results = await asyncio.gather(*(worker(request) for request in requests))
+        await asyncio.gather(*(worker(request) for request in requests))
     elapsed = time.perf_counter() - started
 
-    report_results(name, results, elapsed)
-    return results
-
-
-def report_results(name: str, results: list[Result], elapsed: float) -> None:
-    ok = [result for result in results if result.ok]
-    print(f"  completed {len(ok)}/{len(results)} in {elapsed:.1f} s ({len(ok) / max(elapsed, 1e-9):.2f} req/s)")
-    if not ok:
-        print(f"  no successful request in phase '{name}'; check the server log")
-        return
-    for label, values in (
-        ("TTFT", [result.ttft for result in ok if result.ttft]),
-        ("latency", [result.latency for result in ok]),
-    ):
-        if not values:
-            continue
-        percentiles = ", ".join(
-            f"p{percentile}={statistics.quantiles(values, n=100)[percentile - 1]:.2f}s"
-            if len(values) > 1
-            else f"p{percentile}={values[0]:.2f}s"
-            for percentile in REPORTED_PERCENTILES
-        )
-        print(f"  {label}: mean={statistics.fmean(values):.2f}s, {percentiles}")
+    done = sum(len(group.latencies) for group in stats.values())
+    print(f"  completed {done}/{len(requests)} in {elapsed:.1f} s ({done / max(elapsed, 1e-9):.2f} req/s)")
+    for tier in ("hot", "warm"):
+        if stats[tier].latencies or stats[tier].failures:
+            report_group(stats[tier])
 
 
 def save_dataset(path: str, sequence: list[Request]) -> None:
@@ -335,9 +274,9 @@ async def run(args: argparse.Namespace) -> int:
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
-    hot = build_prefix_texts(tokenizer, args.hot_prefixes, args.prefix_len, args.seed)
-    warm = build_prefix_texts(tokenizer, args.warm_prefixes, args.prefix_len, args.seed + 1)
-    suffixes = build_prefix_texts(tokenizer, args.num_suffixes, args.suffix_len, args.seed + 2)
+    hot = build_distinct_texts(tokenizer, args.hot_prefixes, args.prefix_len, args.seed, "hot")
+    warm = build_distinct_texts(tokenizer, args.warm_prefixes, args.prefix_len, args.seed + 1, "warm")
+    suffixes = build_distinct_texts(tokenizer, args.num_suffixes, args.suffix_len, args.seed + 2, "ask")
 
     if not args.skip_seeding:
         # Every prefix is stored on first use, so send each one once before
