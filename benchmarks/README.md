@@ -214,3 +214,32 @@ Capacity plan (per engine)
 ```
 
 Read both rates from the server log over the measured phase only. `Prefix cache hit rate` is driven by the hot tier and `External prefix cache hit rate` by the warm tier; warm requests should show a non-zero `need to load` in the `kvpool hit tokens ... local prefix cache hit tokens ... need to load` lines. See [FAQ 29](../docs/source/faqs.md) for how to interpret a rate that stays at zero.
+
+### Agent-style multi-turn workload
+
+`benchmarks/scripts/agent_multiturn_bench.py` measures the same two tiers with a workload shaped like a real agent deployment rather than a synthetic prefix set. Every turn after the first re-sends the whole conversation, so the prefix always exists; where it is found depends only on how many other sessions are served in between. Sessions are therefore split into two tiers and the gap is controlled directly: a local session is requeued ahead of the others and finds its context still in the engine's cache, while a pooled session waits behind every other active session and has to read its context back from the pool.
+
+Three levels of reuse result, matching an agent deployment: a system prompt and tool schema shared by every session and always locally hot, each session's own growing conversation which is local or pooled by tier, and the new user message of each turn which is always a miss. Assistant replies are fed back verbatim, so the next prompt genuinely carries the previous one as a byte-identical prefix.
+
+```shell
+python benchmarks/scripts/agent_multiturn_bench.py \
+  --host $BENCH_HOST --port $BENCH_PORT \
+  --model qwen3 --tokenizer $TOKENIZER_PATH \
+  --kv-cache-tokens 64947 --engines 16 --sticky-routing --max-model-len 40960 \
+  --system-len 1024 --session-context-len 4096 --user-len 256 --output-len 256 \
+  --turns 6 --sessions 768 --local-session-fraction 0.25 --concurrency 16
+```
+
+The same capacity planner runs first, sized on the last turn because a conversation keeps growing:
+
+```text
+Capacity plan (per engine)
+  turn 1 prompt            : 5,376 tokens
+  turn 6 prompt            : 7,936 tokens
+  KV cache                 : 64,947 tokens
+  free for conversations   : 57,011 tokens = 7.18 sessions
+  local sessions / engine  : 12.00 (expected to stay resident)
+  pooled sessions / engine : 36.00 (expected to be evicted between turns)
+```
+
+Latency is reported per tier and per turn index, which is the measurement that matters: turn 1 is cold, later local turns should show a much lower TTFT, and pooled turns should land in between. `--save-dataset` writes the conversations as jsonl if you want to replay them elsewhere.
