@@ -183,3 +183,63 @@ Similarly, let's take `Qwen2.5-VL-7B-Instruct` benchmark as an example:
   --model Qwen/Qwen2.5-7B-Instruct --tensor-parallel-size 1 \
   --load-format dummy --num-iters-warmup 5 --num-iters 15
   ```
+
+### Exercising the local prefix cache and the KV pool together
+
+The local prefix cache is consulted before the KV pool, and the pool is only credited with the tokens it adds on top. A workload built from one set of repeated prefixes therefore drives one hit rate or the other but not both: whatever the local cache holds, the pool contributes nothing for. `vllm bench serve --dataset-name prefix_repetition` offers exactly one such set, which is why it commonly reports a high `Prefix cache hit rate` next to `External prefix cache hit rate: 0.0%`.
+
+`benchmarks/scripts/two_tier_prefix_bench.py` drives a two-tier workload instead. A small **hot** set of prefixes is re-requested often enough to stay resident locally and produces the local hit rate, while a much larger **warm** set is cycled round-robin so each prefix is evicted before its next use and has to be re-read from the pool. It also seeds the pool before measuring, because a pool starts empty and the first use of a prefix can only be a miss — the usual reason a first run shows no external hits while a second run does.
+
+Before sending anything, the script checks the plan against the KV cache budget and refuses combinations that cannot work, since a long prefix often leaves room for only one or two of them and no request ordering can fix that. Pass the per-engine `GPU KV cache size` printed at startup, the number of prefill engines, and whether the router pins a prefix to one engine:
+
+```shell
+python benchmarks/scripts/two_tier_prefix_bench.py \
+  --host $BENCH_HOST --port $BENCH_PORT \
+  --model qwen3 --tokenizer $TOKENIZER_PATH \
+  --kv-cache-tokens 64947 --engines 16 --sticky-routing \
+  --prefix-len 8192 --suffix-len 128 --output-len 128 \
+  --hot-prefixes 16 --warm-prefixes 384 --hot-fraction 0.5 \
+  --num-prompts 8000 --concurrency 16
+```
+
+The capacity plan it prints first shows how the budget is spent, and each rejection names the argument to change:
+
+```text
+Capacity plan (per engine)
+  prompt                : 8,320 tokens (65 blocks)
+  KV cache              : 64,947 tokens
+  free for prefixes     : 56,627 tokens = 6.91 prefixes
+  hot prefixes / engine : 1.00 (expected to stay resident)
+  warm prefixes / engine: 24.00 for 5.91 free slots
+```
+
+Read both rates from the server log over the measured phase only. `Prefix cache hit rate` is driven by the hot tier and `External prefix cache hit rate` by the warm tier; warm requests should show a non-zero `need to load` in the `kvpool hit tokens ... local prefix cache hit tokens ... need to load` lines. See [FAQ 29](../docs/source/faqs.md) for how to interpret a rate that stays at zero.
+
+### Agent-style multi-turn workload
+
+`benchmarks/scripts/agent_multiturn_bench.py` measures the same two tiers with a workload shaped like a real agent deployment rather than a synthetic prefix set. Every turn after the first re-sends the whole conversation, so the prefix always exists; where it is found depends only on how many other sessions are served in between. Sessions are therefore split into two tiers and the gap is controlled directly: a local session is requeued ahead of the others and finds its context still in the engine's cache, while a pooled session waits behind every other active session and has to read its context back from the pool.
+
+Three levels of reuse result, matching an agent deployment: a system prompt and tool schema shared by every session and always locally hot, each session's own growing conversation which is local or pooled by tier, and the new user message of each turn which is always a miss. Assistant replies are fed back verbatim, so the next prompt genuinely carries the previous one as a byte-identical prefix.
+
+```shell
+python benchmarks/scripts/agent_multiturn_bench.py \
+  --host $BENCH_HOST --port $BENCH_PORT \
+  --model qwen3 --tokenizer $TOKENIZER_PATH \
+  --kv-cache-tokens 64947 --engines 16 --sticky-routing --max-model-len 40960 \
+  --system-len 1024 --session-context-len 4096 --user-len 256 --output-len 256 \
+  --turns 6 --sessions 768 --local-session-fraction 0.25 --concurrency 16
+```
+
+The same capacity planner runs first, sized on the last turn because a conversation keeps growing:
+
+```text
+Capacity plan (per engine)
+  turn 1 prompt            : 5,376 tokens
+  turn 6 prompt            : 7,936 tokens
+  KV cache                 : 64,947 tokens
+  free for conversations   : 57,011 tokens = 7.18 sessions
+  local sessions / engine  : 12.00 (expected to stay resident)
+  pooled sessions / engine : 36.00 (expected to be evicted between turns)
+```
+
+Latency is reported per tier and per turn index, which is the measurement that matters: turn 1 is cold, later local turns should show a much lower TTFT, and pooled turns should land in between. `--save-dataset` writes the conversations as jsonl if you want to replay them elsewhere.

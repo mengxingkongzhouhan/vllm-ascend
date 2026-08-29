@@ -307,3 +307,82 @@ Enable FlashComm_v1 (`VLLM_ASCEND_ENABLE_FLASHCOMM1=1`) when using Tensor Parall
 ### 26. What is the difference between FIA and PA operators for attention?
 
 FIA (Flash Attention) is the default attention operator in vLLM-Ascend. In some batch-size settings (particularly medium concurrency), FIA may exhibit suboptimal performance. The PA (Page Attention) operator can be manually enabled via `pa_shape_list` in `--additional-config`. When the runtime batch size matches a value in `pa_shape_list`, the framework switches to PA. This is a temporary tuning knob — future FIA optimizations will make this parameter obsolete.
+
+### 27. Startup hangs for minutes and then fails with "Failed to start the device" (error code 507033)
+
+Startup blocks in `torch.npu.set_device` and eventually raises something like:
+
+```text
+RuntimeError: ExchangeDevice: ... c10_npu::SetDevice(device), error code is 507033
+[Error]: Failed to start the device.
+Inner_Error_Failed_Load_Package_To_Device(E39011): Failed to load the package cann-hybm-compat.tar.gz on the device.
+TsdOpen failed. devId=2, tdt error=1.
+```
+
+Every worker fails the same way, and because the CANN runtime retries internally before giving up, the server looks frozen for several minutes first — the last thing in the log is usually the vLLM-Ascend configuration dump. vLLM-Ascend reports the stage it is waiting in (`Startup stage 'bind_npu_device' is still running after ...`) while this happens, so the log identifies where it is stuck.
+
+This is an environment-level failure; no model or vLLM option affects it. Check the following, in order:
+
+1. **Device allocation.** A device that the container runtime did not grant cannot be started, even when its device node is visible inside the container. Note the `devId` values in the error: if different workers report devices that the container was never allocated, the parallel size does not match the allocation. The error message prints `ASCEND_VISIBLE_DEVICES` and the `/dev/davinci*` nodes it found, so compare the two. On Kubernetes, the `huawei.com/Ascend910` request must cover the full tensor/data parallel size of the ranks that run in the pod, and device visibility must be left to the device plugin rather than mounted by hand.
+2. **Driver/firmware and CANN toolkit compatibility.** `cann-hybm-compat.tar.gz` is loaded onto the device when it starts, and loading it fails when the CANN toolkit is newer than the driver it runs against. Compare `/usr/local/Ascend/driver/version.info` with `$ASCEND_HOME_PATH/*-linux/ascend_toolkit_install.info` (both values are printed in the error message) against the compatibility matrix of your CANN release, and upgrade the driver/firmware or the toolkit so that they match. After a host driver or firmware upgrade the container must be recreated, not just restarted.
+3. **Device availability.** A card still held by a process from a previous run, or one in an unhealthy state, cannot be started again. Run `npu-smi info` to inspect it, terminate leftover processes, and reset the card with `npu-smi set -t reset -i <card_id> -c <chip_id>`.
+
+Host logs under `~/ascend/log` and device logs under `/var/log/npu` carry the underlying driver error, so mount `/var/log/npu` into the container if it is not already available there.
+
+### 28. The prefill instance logs "Force freed ... expired requests" during P/D disaggregation
+
+```text
+ERROR [mooncake_connector.py] Force freed 12 expired requests: the decode side never pulled their kv cache. ...
+```
+
+After prefill finishes a request, the prefill instance deliberately keeps its KV blocks allocated and waits for the decode instance to pull them. The blocks are only released once the decode side reports the pull as complete. If no such report arrives within `VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT` seconds, the prefill instance force-frees the blocks and logs this message.
+
+So the message is a symptom on the prefill side of the decode side not consuming, not a fault of the prefill instance. Until the timeout fires, every affected request pins its blocks, so a steady stream of these lines also means the prefill KV cache is being consumed by requests that will never be served — expect queueing and falling throughput alongside them.
+
+Read the numbers in the message before changing anything:
+
+- **The delayed queue depth keeps growing** and the longest wait sits close to the threshold: the decode instance cannot keep up with what the proxy dispatches to it, or is stalled. Check the decode instance's queue and KV cache usage, and lower the request rate or add decode capacity.
+- **Only some prefill ranks report it**, consistently the same ones: suspect a P/D topology mismatch (TP/DP/EP sizes, or the `remote_*` parameters the proxy passes), which leaves some ranks never notified.
+- **It starts after a decode instance restart**: requests in flight at the time can never be pulled, and these lines are the expected cleanup. They should stop once the backlog drains.
+- **It coincides with client-side timeouts or aborts**: a client that gives up after prefill leaves nothing to pull. Align the client timeout with `VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT`.
+
+If pulls are failing rather than arriving late, check the transfer network between the instances: `NETWORK_CARD_NAME`/`IP_ADDRESS` in the launch scripts, `/etc/hccn.conf`, and reachability of the side-channel port. Raising `VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT` only delays the cleanup; it does not make the pull happen.
+
+### 29. "External prefix cache hit rate" stays at 0% even though the KV pool reports hits
+
+The two numbers measure different things, and a large pool hit next to a 0% external hit rate is consistent rather than contradictory:
+
+```text
+INFO [pool_scheduler.py] Reqid: ..., Total tokens 30856, kvpool hit tokens: 30720, local prefix cache hit tokens: 30720, need to load: 0
+INFO [loggers.py] ... Prefix cache hit rate: 88.5%, External prefix cache hit rate: 0.0%
+```
+
+The local prefix cache is consulted first. The KV pool is then asked only what it can add *beyond* that, and `need to load` is the difference between the two hit counts. When the local cache already covers the whole prefix, the difference is zero, the connector reports no external tokens, and the external hit rate stays at 0%. The pool lookup did hit; the hit was simply redundant, so nothing was transferred.
+
+Before changing any configuration, note that the logged rate covers one logging interval, not the whole run. Every engine keeps its own local prefix cache, so a prefix is a local miss once per engine and a local hit forever after. External hits are therefore concentrated in the warm-up, and a sample taken at steady state reads 0% even on a perfectly healthy pool. Compare the earliest intervals of the run, or the cumulative figure, before concluding the pool is not being read.
+
+That also bounds what this benchmark can report. With `--dataset-name prefix_repetition`, `E` engines, `P` distinct prefixes and `N` prompts, only the first use of a prefix on a given engine can be an external hit, so the ceiling is roughly `E * P / N` — and all of it lands during warm-up. Ten prefixes across sixteen engines and a thousand prompts cannot exceed about 15%, and reads 0% once warm.
+
+A sustained external hit rate needs three conditions at once, so tune `P` and `N` together and check the request order:
+
+- **The prefixes each engine sees must not fit in its local KV cache**, otherwise nothing is ever evicted and every reuse is a local hit. Each engine sees about `min(P, N / E)` distinct prefixes; multiply that by the prefix length and compare against the engine's `GPU KV cache size` (printed at startup). Aim for a few times larger. Lowering `--gpu-memory-utilization` or setting `--kv-cache-memory-bytes` achieves the same thing without changing the workload — at the cost of throughput, so this trades production capacity for a more pool-heavy measurement.
+- **Each prefix must still be reused enough to be worth caching.** Reuse per prefix is `N / P`; pushing `P` up to `N` means every prefix is requested once and there is nothing to hit at all. Keep reuse at roughly ten or more by raising `--num-prompts` alongside `--prefix-repetition-num-prefixes`.
+- **Reuses must be far enough apart to be evicted in between.** Overflowing the aggregate working set is not enough on its own: if the workload sends all requests for one prefix back to back, or the router pins a prefix to one engine, that engine answers every reuse from its local cache no matter how small the cache is. A local hit rate far above the fraction of prefixes that fit in one engine's cache is the signature of this.
+
+A quick way to measure the capacity in prefixes: when a log line reports `Running: 0 reqs`, the reported `GPU KV cache usage` is entirely cached blocks, so the percentage that one prefix occupies gives the capacity directly. A 30720-token prefix sitting at 47.3% means roughly 65000 tokens of KV cache, or about two such prefixes per engine.
+
+With prefix-aware or sticky routing the third condition still holds, but the quantity to compare against the cache is the prefixes *per engine* rather than the total. A prefix always returns to the same engine, so that engine must be unable to keep its own assigned set resident: `P / E` prefixes have to overflow one engine's KV cache. Ten prefixes over sixteen engines is under one prefix each and will never evict, however many engines there are. Sticky routing does not have to be turned off to see external hits; `P` has to be raised past `E` times the per-engine capacity in prefixes, with `N` raised alongside it to keep reuse up.
+
+Two further sources of external hits exist under sticky routing and need no workload change at all:
+
+- **KV pressure from concurrent requests.** Running requests allocate blocks from the same cache and evict the cached prefixes. When the prompt is a large fraction of the cache, a handful of concurrent requests is enough. A benchmark sample that shows `Running: 0 reqs` has no such pressure, which is a common reason a measurement reports nothing while production would not.
+- **Topology changes.** An engine restart, or a router remap after scaling, moves a prefix to an engine that has never seen it, which then loads from the pool. This is much of the value of a shared pool under sticky routing, and the cold-start replay above is the way to measure it.
+
+Note that layerwise mode loads from the pool even when the local cache already holds the tokens, but the connector still reports the local-vs-pool difference, so the external hit rate stays at 0% regardless. Do not enable it expecting this metric to move.
+
+Two further options are useful for verification rather than measurement:
+
+- **Start from a cold local cache.** Run once to populate the pool, restart the instance, then replay the same dataset with the same `--seed`. The local cache is empty while the pool is warm, which is the clearest demonstration that reads come from the pool.
+- **Turn off local prefix caching** (`--no-enable-prefix-caching`) to route every lookup to the pool. Good for proving the pool path works end to end, but not a realistic serving configuration.
+
+If even the warm-up intervals report 0% external hits, then cross-engine sharing itself is not happening, and the workload is not the problem. Check that all engines are backed by the same store instance and namespace rather than one store each, and that block hashes are stable across processes — set `--prefix-caching-hash-algo sha256`, since the built-in hash is not guaranteed to agree between processes. Also check that requests sharing a prefix are not all routed to the same engine: with sticky or prefix-aware routing the local cache absorbs everything, whereas round-robin routing spreads a prefix across engines and is exactly where a shared pool earns its place.

@@ -562,11 +562,15 @@ class KVPoolScheduler:
         else:
             need_to_allocate = num_external_hit_tokens - num_computed_tokens
 
+        # Report the local hit next to the pool hit: `need to load` is their
+        # difference, so a pool hit that the local prefix cache already covers
+        # loads nothing and is reported as no external hit at all.
         logger.info(
-            "Reqid: %s, Total tokens %d, kvpool hit tokens: %d, need to load: %d",
+            "Reqid: %s, Total tokens %d, kvpool hit tokens: %d, local prefix cache hit tokens: %d, need to load: %d",
             request.request_id,
             request.num_tokens,
             num_external_hit_tokens,
+            num_computed_tokens,
             need_to_allocate,
         )
 

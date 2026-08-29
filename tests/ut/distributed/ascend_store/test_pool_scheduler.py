@@ -181,6 +181,33 @@ class TestKVPoolScheduler(unittest.TestCase):
         self.assertEqual(need, 0)
 
     @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
+    def test_pool_hit_already_covered_locally_reports_no_external_hit(self, mock_client_cls):
+        config = self._make_config(block_size=16)
+        scheduler = KVPoolScheduler(config, use_layerwise=False)
+        # The pool holds exactly the prefix the local cache already matched.
+        mock_client_cls.return_value.lookup.return_value = 48
+
+        request = MagicMock()
+        request.prompt_token_ids = list(range(64))
+        request.num_tokens = 64
+        request.request_id = "r1"
+        request.block_hashes = [b"h"] * 4
+
+        with patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.logger") as mock_logger:
+            need, is_async = scheduler.get_num_new_matched_tokens(request, 48)
+
+        # Nothing is left for the pool to contribute, so this request counts as
+        # no external prefix cache hit at all.
+        self.assertEqual((need, is_async), (0, False))
+        self.assertNotIn("r1", scheduler.load_specs)
+        # Both hit counts must be logged, otherwise a zero external hit rate
+        # next to a large pool hit cannot be explained from the log.
+        log_args = mock_logger.info.call_args[0]
+        self.assertEqual(log_args[3], 48)
+        self.assertEqual(log_args[4], 48)
+        self.assertEqual(log_args[5], 0)
+
+    @patch("vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.pool_scheduler.LookupKeyClient")
     def test_update_state_after_alloc_no_load_spec(self, mock_client_cls):
         config = self._make_config()
         scheduler = KVPoolScheduler(config, use_layerwise=False)
