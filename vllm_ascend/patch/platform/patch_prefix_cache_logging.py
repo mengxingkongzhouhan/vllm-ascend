@@ -27,7 +27,7 @@ def _time_prefix_cache_lookup(
         lookup_time_ms = (time.perf_counter() - lookup_start) * 1000
         if self.enable_caching:
             logger.info(
-                "Local prefix cache lookup: request_id=%s, hit_length=%d tokens, query_time=%.3f ms",
+                "Request %s local prefix lookup: hit_tokens=%d, duration=%.3f ms",
                 request.request_id,
                 result[1],
                 lookup_time_ms,

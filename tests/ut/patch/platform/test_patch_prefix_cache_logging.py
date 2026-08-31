@@ -23,7 +23,7 @@ def test_prefix_cache_lookup_logs_hit_length_and_query_time(
 
     assert result == ("blocks", 128, 64)
     logger_info.assert_called_once_with(
-        "Local prefix cache lookup: request_id=%s, hit_length=%d tokens, query_time=%.3f ms",
+        "Request %s local prefix lookup: hit_tokens=%d, duration=%.3f ms",
         "request-1",
         128,
         pytest.approx(1.25),
