@@ -639,6 +639,9 @@ class BatchJobAwareScheduler(Scheduler):
         self.waiting = BatchJobAwareRequestQueue(
             self, self._job_decode_estimator, self._block_reserver, self._job_name_parser, _config
         )
+        from vllm_ascend.core.prefill_dp_queue_stats import install_prefill_dp_queue_stats
+
+        install_prefill_dp_queue_stats(self)
 
     def schedule(self, *args, **kwargs):
         """Override to invalidate the block-reserve cache before each step.
