@@ -40,6 +40,9 @@
 #       vLLM v1 scheduling currently enables chunkedprefill by default, which processes prefill and decode
 #       requests simultaneously in a single scheduling session. This can impact the overall system throughput
 #       and performance in some scenarios.
+#       On PD-disaggregated P nodes, BalanceScheduler also installs per-DP queue
+#       stats logging (running/waiting counts, running token sum, KV-pool load
+#       token sum) when a request is admitted into the running queue.
 #    How：
 #       Set --additional-config '{"enable_balance_scheduling": true}' or
 #       set environmental variable VLLM_ASCEND_BALANCE_SCHEDULING=1 (deprecated).

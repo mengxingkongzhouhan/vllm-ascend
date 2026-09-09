@@ -142,6 +142,11 @@ class BalanceScheduler(Scheduler):
                 torch.tensor([0], dtype=torch.int, device="cpu")
                 for _ in range(self.vllm_config.parallel_config.data_parallel_size)
             ]
+        # PD-disaggregated P nodes: log per-DP running/waiting/KV-pool stats
+        # when a request is admitted into the running queue.
+        from vllm_ascend.core.prefill_dp_queue_stats import install_prefill_dp_queue_stats
+
+        install_prefill_dp_queue_stats(self)
 
     def balance_gather(self):
         """All-gather per-rank running counts into ``self.balance_queue``.

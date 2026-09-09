@@ -78,6 +78,9 @@ class ProfilingChunkScheduler(Scheduler):
             include_finished_set=include_finished_set,
             log_stats=log_stats,
         )
+        from vllm_ascend.core.prefill_dp_queue_stats import install_prefill_dp_queue_stats
+
+        install_prefill_dp_queue_stats(self)
 
         from vllm_ascend.ascend_config import get_ascend_config, init_ascend_config
 

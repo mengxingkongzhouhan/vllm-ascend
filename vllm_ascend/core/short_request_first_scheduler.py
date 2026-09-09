@@ -382,3 +382,6 @@ class ShortRequestFirstAsyncScheduler(AsyncScheduler):
                 threshold=short_request_first_config.threshold,
                 long_max_wait_ms=short_request_first_config.long_max_wait_ms,
             )
+        from vllm_ascend.core.prefill_dp_queue_stats import install_prefill_dp_queue_stats
+
+        install_prefill_dp_queue_stats(self)
